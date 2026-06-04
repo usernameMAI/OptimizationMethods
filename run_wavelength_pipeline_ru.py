@@ -15,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.decomposition import PCA
 from sklearn.feature_selection import mutual_info_classif, f_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix, classification_report
@@ -28,7 +27,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, TensorDataset
 except Exception:
     torch = None
     nn = None
@@ -37,21 +35,17 @@ except Exception:
 METHOD_ORDER = [
     "Полный спектр LR",
     "MI top-12 + LR",
-    "PCA, 12 компонент + LR",
     "SPA top-12 + LR",
     "ADMM direct LS",
     "ADMM top-12 + LR",
-    "Автоэнкодер latent + LR",
 ]
 
 METHOD_KEY_TO_NAME = {
     "full": "Полный спектр LR",
     "mi": "MI top-12 + LR",
-    "pca": "PCA, 12 компонент + LR",
     "spa": "SPA top-12 + LR",
     "admm_direct": "ADMM direct LS",
     "admm_top12": "ADMM top-12 + LR",
-    "autoencoder": "Автоэнкодер latent + LR",
 }
 
 
@@ -195,7 +189,7 @@ def make_split(X, y, groups, n_splits=5, fold_index=0, seed=42):
     return tr, te, {"split_method": method, "n_splits_actual": n_splits_actual, "plant_leakage": leak}
 
 
-def fit_lr_eval(Xtr, Xte, ytr, yte, selected_idx=None, pca_components=None, seed=42):
+def fit_lr_eval(Xtr, Xte, ytr, yte, selected_idx=None, seed=42):
     t0 = time.perf_counter()
     if selected_idx is not None:
         Xtr0 = Xtr[:, selected_idx]
@@ -203,14 +197,6 @@ def fit_lr_eval(Xtr, Xte, ytr, yte, selected_idx=None, pca_components=None, seed
         scaler = StandardScaler().fit(Xtr0)
         Xtr1 = scaler.transform(Xtr0)
         Xte1 = scaler.transform(Xte0)
-    elif pca_components is not None:
-        scaler = StandardScaler().fit(Xtr)
-        Xtr_s = scaler.transform(Xtr)
-        Xte_s = scaler.transform(Xte)
-        ncomp = min(int(pca_components), Xtr_s.shape[1], max(1, Xtr_s.shape[0] - 1))
-        pca = PCA(n_components=ncomp, random_state=seed).fit(Xtr_s)
-        Xtr1 = pca.transform(Xtr_s)
-        Xte1 = pca.transform(Xte_s)
     else:
         scaler = StandardScaler().fit(Xtr)
         Xtr1 = scaler.transform(Xtr)
@@ -369,72 +355,6 @@ def run_admm_ls(Xtr, Xte, ytr, yte, args, classes):
     return pred, row_scores, pd.DataFrame(history), admm_info, elapsed
 
 
-class DenseAE(nn.Module):
-    def __init__(self, p, latent_dim):
-        super().__init__()
-        h1 = min(128, max(32, p // 2))
-        h2 = min(64, max(16, p // 4))
-        self.encoder = nn.Sequential(
-            nn.Linear(p, h1), nn.ReLU(),
-            nn.Linear(h1, h2), nn.ReLU(),
-            nn.Linear(h2, latent_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, h2), nn.ReLU(),
-            nn.Linear(h2, h1), nn.ReLU(),
-            nn.Linear(h1, p)
-        )
-    def forward(self, x):
-        z = self.encoder(x)
-        rec = self.decoder(z)
-        return rec, z
-
-
-def run_autoencoder(Xtr, Xte, ytr, yte, args):
-    if torch is None:
-        raise RuntimeError("PyTorch не установлен, автоэнкодер недоступен")
-    requested = args.device
-    if requested == "cuda" and not torch.cuda.is_available():
-        device = torch.device("cpu")
-    else:
-        device = torch.device(requested)
-    scaler = StandardScaler().fit(Xtr)
-    Xtr_s = scaler.transform(Xtr).astype("float32")
-    Xte_s = scaler.transform(Xte).astype("float32")
-    model = DenseAE(Xtr_s.shape[1], int(args.ae_latent_dim)).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.ae_lr, weight_decay=args.ae_weight_decay)
-    loss_fn = nn.MSELoss()
-    ds = TensorDataset(torch.tensor(Xtr_s, dtype=torch.float32))
-    loader = DataLoader(ds, batch_size=min(args.ae_batch_size, len(ds)), shuffle=True, drop_last=False)
-    losses = []
-    t0 = time.perf_counter()
-    model.train()
-    for epoch in range(1, int(args.ae_epochs) + 1):
-        vals = []
-        for (xb,) in loader:
-            xb = xb.to(device)
-            opt.zero_grad()
-            rec, _ = model(xb)
-            loss = loss_fn(rec, xb)
-            loss.backward()
-            opt.step()
-            vals.append(float(loss.item()))
-        losses.append({"epoch": epoch, "loss": float(np.mean(vals))})
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    ae_time = time.perf_counter() - t0
-    model.eval()
-    with torch.no_grad():
-        Ztr = model.encoder(torch.tensor(Xtr_s, dtype=torch.float32, device=device)).detach().cpu().numpy()
-        Zte = model.encoder(torch.tensor(Xte_s, dtype=torch.float32, device=device)).detach().cpu().numpy()
-    t1 = time.perf_counter()
-    clf = LogisticRegression(max_iter=3000, class_weight="balanced", solver="lbfgs", random_state=args.seed)
-    clf.fit(Ztr, ytr)
-    pred = clf.predict(Zte)
-    total_time = ae_time + (time.perf_counter() - t1)
-    return pred, total_time, pd.DataFrame(losses), {"device_used": str(device), "latent_dim": int(args.ae_latent_dim), "epochs": int(args.ae_epochs)}
-
-
 def fmt_seconds(sec):
     sec = float(sec)
     if sec < 60:
@@ -585,19 +505,6 @@ def plot_admm_history(hist, outdir):
         plt.close(fig)
 
 
-def plot_ae_loss(losses, outdir):
-    if losses is None or losses.empty:
-        return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(losses["epoch"], losses["loss"])
-    ax.set_xlabel("Эпоха")
-    ax.set_ylabel("MSE реконструкции")
-    ax.set_title("Обучение автоэнкодера")
-    fig.tight_layout()
-    fig.savefig(Path(outdir) / "08_autoencoder_loss_ru.png", dpi=220)
-    plt.close(fig)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", required=True)
@@ -607,7 +514,7 @@ def main():
     ap.add_argument("--drop-days", type=int, nargs="*", default=[])
     ap.add_argument("--stage-map", default="")
     ap.add_argument("--k-waves", type=int, default=12)
-    ap.add_argument("--methods", nargs="+", default=["full", "mi", "pca", "spa", "admm_direct", "admm_top12", "autoencoder"],
+    ap.add_argument("--methods", nargs="+", default=["full", "mi", "spa", "admm_direct", "admm_top12"],
                     choices=list(METHOD_KEY_TO_NAME.keys()))
     ap.add_argument("--n-splits", type=int, default=5)
     ap.add_argument("--fold-index", type=int, default=0)
@@ -622,11 +529,6 @@ def main():
     ap.add_argument("--admm-tol", type=float, default=1e-4)
     ap.add_argument("--admm-log-every", type=int, default=20)
     ap.add_argument("--max-seconds", type=float, default=0.0)
-    ap.add_argument("--ae-latent-dim", type=int, default=8)
-    ap.add_argument("--ae-epochs", type=int, default=300)
-    ap.add_argument("--ae-batch-size", type=int, default=64)
-    ap.add_argument("--ae-lr", type=float, default=1e-3)
-    ap.add_argument("--ae-weight-decay", type=float, default=1e-5)
     ap.add_argument("--spa-min-gap-nm", type=float, default=0.0)
     args = ap.parse_args()
 
@@ -644,7 +546,6 @@ def main():
     selected = {}
     selected_rows = []
     admm_hist = None
-    ae_losses = None
 
     def add_method(name, pred, time_sec, n_features, extra=None):
         m = metrics_dict(yte, pred)
@@ -677,10 +578,6 @@ def main():
         add_method(name, pred, sec, len(idx), {"selection_time_sec": sec - lr_sec, "classifier_time_sec": lr_sec})
         for rank, j in enumerate(idx, 1):
             selected_rows.append({"method": name, "rank": rank, "index": int(j), "wavelength_nm": float(wavelengths[j]), "score": float(scores[j])})
-
-    if "pca" in args.methods:
-        pred, sec = fit_lr_eval(Xtr, Xte, ytr, yte, pca_components=args.k_waves, seed=args.seed)
-        add_method(METHOD_KEY_TO_NAME["pca"], pred, sec, min(args.k_waves, X.shape[1]))
 
     if "spa" in args.methods:
         t0 = time.perf_counter()
@@ -721,12 +618,6 @@ def main():
                 selected_rows.append({"method": name, "rank": rank, "index": int(j), "wavelength_nm": float(wavelengths[j]), "score": float(admm_scores[j])})
         if admm_hist is not None:
             admm_hist.to_csv(Path(args.outdir) / "admm_history.csv", index=False)
-
-    if "autoencoder" in args.methods:
-        pred, sec, ae_losses, ae_info = run_autoencoder(Xtr, Xte, ytr, yte, args)
-        add_method(METHOD_KEY_TO_NAME["autoencoder"], pred, sec, int(args.ae_latent_dim), ae_info)
-        if ae_losses is not None:
-            ae_losses.to_csv(Path(args.outdir) / "autoencoder_loss.csv", index=False)
 
     df = pd.DataFrame(rows)
     df["method"] = pd.Categorical(df["method"], categories=METHOD_ORDER, ordered=True)
@@ -773,7 +664,6 @@ def main():
     plot_selected_waves(X, y.astype(str), wavelengths, selected, Path(args.outdir) / "04_selected_wavelengths_ru.png")
     plot_confusion(cm, labels, f"Матрица ошибок: лучший метод — {best_method}", Path(args.outdir) / "05_confusion_best_ru.png")
     plot_admm_history(admm_hist, args.outdir)
-    plot_ae_loss(ae_losses, args.outdir)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(df.to_string(index=False))

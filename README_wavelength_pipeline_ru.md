@@ -1,121 +1,198 @@
-# Единый пайплайн сравнения методов отбора волн
+    # Сравнение методов отбора длин волн для классификации спектров
 
-Считает метрики и время работы для методов, которые остаются в дипломе:
+Скрипт `run_wavelength_pipeline_ru.py` берёт усреднённые по растению-дню спектры
+и сравнивает несколько способов снижать число длин волн перед линейным
+классификатором. Вся постановка ориентирована на гиперспектральные снимки
+листьев (FX17, IQ): один объект — это один лист одного растения в один день
+съёмки. Чтобы метрики не были оптимистичными, разбиение на train/test делается
+по растениям: одно растение никогда не попадает одновременно в обе выборки.
 
-- полный спектр + LR;
-- Mutual Information top-12 + LR;
-- PCA, 12 компонент + LR;
-- SPA top-12 + LR;
-- ADMM direct LS;
-- ADMM top-12 + LR;
-- автоэнкодер latent + LR.
+## Что сравниваем
 
-Во всех задачах используется групповое разбиение по растениям: одно растение не попадает одновременно в train и test.
+В пайплайне реализованы пять методов. Везде, где итоговый классификатор —
+логистическая регрессия (LR), используется одна и та же конфигурация:
+`StandardScaler` на train + `LogisticRegression(max_iter=3000,
+class_weight="balanced", solver="lbfgs")`. Это нужно, чтобы разница в метриках
+объяснялась именно отбором признаков, а не настройкой классификатора.
 
-## Выходы одного запуска
+### 1. Полный спектр + LR (`full`)
+Базовый способ: на вход LR подаётся весь спектр (все длины волн без отбора).
+Служит верхней опорной точкой по информации и нижней — по интерпретируемости.
 
-В каждой папке результата будут:
+### 2. MI top-12 + LR (`mi`)
+Отбор по взаимной информации между каждой длиной волны и меткой класса
+(`sklearn.feature_selection.mutual_info_classif`). Берём top-`k` длин волн с
+наибольшим MI и обучаем LR только на них. Метод одномерный: каждая волна
+оценивается независимо, без учёта корреляций между ними.
 
-- `method_metrics.csv` — Accuracy, Balanced Accuracy, F1 macro, число признаков, время;
-- `selected_wavelengths.csv` — выбранные волны для MI, SPA, ADMM top-12;
-- `run_summary.json` — размер выборки, split, plant leakage;
-- `00_results_table_ru.png` — таблица метрик;
-- `01_balanced_accuracy_ru.png` — график BA;
-- `02_runtime_log_ru.png` — график времени;
-- `03_accuracy_ba_f1_ru.png` — сравнение Accuracy/BA/F1;
-- `04_selected_wavelengths_ru.png` — выбранные волны на средних спектрах;
-- `05_confusion_best_ru.png` — confusion matrix лучшего метода;
-- `06_admm_residuals_ru.png`, `07_admm_objective_ru.png` — графики ADMM;
-- `08_autoencoder_loss_ru.png` — обучение автоэнкодера.
+### 3. SPA top-12 + LR (`spa`)
+Successive Projections Algorithm: жадный отбор взаимно ортогональных
+(плохо объяснимых уже выбранными) длин волн с учётом релевантности к меткам.
 
-## Команды запуска
+Реализация в `spa_select`:
+1. Стандартизуем train-спектры.
+2. Считаем релевантность каждой волны через `f_classif` (ANOVA F-score) и
+   нормируем в [0, 1].
+3. В качестве первой выбранной волны берём ту, у которой нормированная
+   релевантность максимальна.
+4. На каждой следующей итерации для каждой ещё не выбранной волны решаем
+   задачу наименьших квадратов «спроецируй меня на подпространство уже
+   выбранных» (`np.linalg.lstsq`) и берём норму остатка — это мера
+   «новизны» признака.
+5. Финальный скоринг каждой волны-кандидата:
+   `score = relevance * (0.25 + 0.75 * residual_norm / max_residual_norm)`.
+   Так одновременно поощряются и информативные, и малокоррелированные с
+   уже выбранными признаки.
+6. Опционально применяется ограничение на минимальный шаг между выбранными
+   длинами волн (`--spa-min-gap-nm`).
 
-### FX17, здоровые / больные
+### 4. ADMM direct LS (`admm_direct`)
+Прямой регрессионный классификатор с регуляризацией, обученный методом
+ADMM (Alternating Direction Method of Multipliers) на GPU/CPU через PyTorch.
+Решается задача:
 
-```bash
-python3 /beta/home/sashanoir/run_wavelength_pipeline_ru.py \
-  --input-dir /beta/home/sashanoir/plots_fx_plantday_12masks \
-  --outdir /beta/home/sashanoir/wavecmp_fx_health_drop_day9 \
-  --dataset-name "FX17" \
-  --task health \
-  --drop-days 9 \
-  --k-waves 12 \
-  --device cuda \
-  --admm-max-iter 2000 \
-  --admm-tol 1e-4 \
-  --ae-epochs 300
+```
+minimize  (1 / 2n) * ||X B - Y||_F^2
+        + lambda_l1 * ||B||_1
+        + lambda_tv * ||D B||_1
+        + (lambda_l2 / 2) * ||B||_F^2
 ```
 
-### FX17, временные стадии
+где `Y` — one-hot матрица меток, `D` — разностный оператор первого порядка
+(матрица `(p-1) x p` с -1 и +1 на соседних позициях), который штрафует резкие
+скачки коэффициентов между соседними длинами волн (TV-регуляризация по
+спектру). На выходе `B` имеет размер `p x C` (длины волн × классы).
+
+ADMM раскладывает задачу на три блока со сплит-переменными:
+- `B` — основные коэффициенты (квадратичный шаг, замкнутое решение через
+  `torch.linalg.solve` от константной матрицы
+  `A = X^T X / n + lambda_l2 I + rho_z I + rho_v D^T D`);
+- `Z = B` — для L1-штрафа, обновляется мягким пороговым оператором
+  `soft_threshold(B + U, lambda_l1 / rho_z)`;
+- `V = D B` — для TV-штрафа, обновляется тем же мягким порогом
+  `soft_threshold(DB + T, lambda_tv / rho_v)`;
+- `U`, `T` — двойственные переменные (накопленные множители).
+
+На каждой итерации логируются первичный и двойственный остатки и
+значение целевой функции; цикл останавливается по достижению
+`--admm-tol` или после `--admm-max-iter` итераций (плюс опциональный
+лимит по времени `--max-seconds`). В режиме `admm_direct` предсказание
+получается напрямую: `argmax_c (X_test @ B)_c`, никакой LR сверху не
+обучается. То есть это «решение задачи оптимизации напрямую как
+классификатор» — этим и отличается от LR-варианта ниже.
+
+### 5. ADMM top-12 + LR (`admm_top12`)
+Тот же ADMM, что и выше, но используется только как инструмент отбора
+признаков. По обученной матрице `B` считается важность каждой длины волны
+как `||B[j, :]||_2` (норма строки), берутся top-`k` волн с максимальной
+важностью, и на этом подмножестве обучается обычная LR. Так мы сравниваем
+ADMM с MI и SPA в одинаковых условиях: «отбор `k` волн + LR на них».
+
+## Разбиение train/test
+
+В `make_split` сначала пытается отработать `StratifiedGroupKFold`
+(стратификация по классам + групповое разбиение по растениям). Если число
+групп слишком мало для запрошенного числа фолдов, делается фолбэк на
+`GroupShuffleSplit` с одним сплитом. Параметр `--fold-index` выбирает,
+какой именно фолд использовать. После разбиения дополнительно проверяется
+plant leakage — пересечение растений между train и test (должно быть 0).
+
+## Что попадает на выход
+
+В `--outdir` после одного запуска появляются:
+
+- `method_metrics.csv` — Accuracy, Balanced Accuracy, F1 macro, число
+  использованных признаков, время работы метода (включая отбор и обучение);
+- `selected_wavelengths.csv` — выбранные длины волн для MI, SPA и
+  ADMM top-12 (индексы, нм, скоры, ранги);
+- `run_summary.json` — параметры запуска, размеры train/test, метод
+  разбиения, plant leakage, инфо по сходимости ADMM;
+- графики:
+  - `00_results_table_ru.png` — итоговая таблица метрик;
+  - `01_balanced_accuracy_ru.png` — балансированная accuracy по методам;
+  - `02_runtime_log_ru.png` — время работы (логарифмическая шкала);
+  - `03_accuracy_ba_f1_ru.png` — Accuracy / BA / F1 рядом;
+  - `04_selected_wavelengths_ru.png` — выбранные волны на средних спектрах
+    каждого класса;
+  - `05_confusion_best_ru.png` — confusion matrix лучшего по BA метода;
+  - `06_admm_residuals_ru.png` — primal/dual остатки ADMM;
+  - `07_admm_objective_ru.png` — траектория целевой функции ADMM.
+
+## Локальный запуск
+
+Минимально нужно:
+
+- Python 3.10+;
+- `numpy`, `pandas`, `scikit-learn`, `matplotlib`, `pyarrow`, `torch`
+  (для ADMM; CPU-сборки достаточно).
+
+Скрипт принимает данные в одном из двух форматов в `--input-dir`:
+
+1. Тройка файлов:
+   - `X_plant_day.npy` — матрица `(n_objects, n_wavelengths)`;
+   - `meta_plant_day.csv` — метаданные с колонками `plant_id`/`plant_label`,
+     `day_num`, `health` (для `task=health`);
+   - `wavelengths.npy` — вектор длин волн (нм).
+2. Либо один `plant_day_spectra.parquet` с колонкой-вектором спектра
+   (`spectrum`/`spec`/`mean_spectrum`/...) и теми же метаданными.
+
+### Здоровые / больные
 
 ```bash
-python3 /beta/home/sashanoir/run_wavelength_pipeline_ru.py \
-  --input-dir /beta/home/sashanoir/plots_fx_plantday_12masks \
-  --outdir /beta/home/sashanoir/wavecmp_fx_stages_drop_day9 \
+python3 run_wavelength_pipeline_ru.py \
+  --input-dir ./data/fx17 \
+  --outdir ./out/fx17_health \
+  --dataset-name "FX17" \
+  --task health \
+  --k-waves 12 \
+  --device cpu
+```
+
+### Стадии болезни
+
+`--stage-map` задаёт группировку дней съёмки в стадии. Формат:
+`имя_стадии:дни_через_запятую;следующая_стадия:...`.
+
+```bash
+python3 run_wavelength_pipeline_ru.py \
+  --input-dir ./data/fx17 \
+  --outdir ./out/fx17_stages \
   --dataset-name "FX17" \
   --task stages \
-  --drop-days 9 \
   --stage-map "ранняя:0,1,2,3,4,5;переходная:6,7,8;поздняя:10,11;симптоматическая:12" \
   --k-waves 12 \
-  --device cuda \
-  --admm-max-iter 2000 \
-  --admm-tol 1e-4 \
-  --ae-epochs 300
+  --device cpu
 ```
 
-### IQ, здоровые / больные
+### Запуск только части методов
+
+`--methods` ограничивает список методов. Например, без ADMM:
 
 ```bash
-python3 /beta/home/sashanoir/run_wavelength_pipeline_ru.py \
-  --input-dir /beta/home/sashanoir/plots_iq_plantday_clean \
-  --outdir /beta/home/sashanoir/wavecmp_iq_health_drop_day0_1_2 \
-  --dataset-name "IQ" \
-  --task health \
-  --drop-days 0 1 2 \
-  --k-waves 12 \
-  --device cuda \
-  --admm-max-iter 2000 \
-  --admm-tol 1e-4 \
-  --ae-epochs 300
+python3 run_wavelength_pipeline_ru.py ... --methods full mi spa
 ```
 
-### IQ, временные стадии
+Доступные ключи: `full`, `mi`, `spa`, `admm_direct`, `admm_top12`.
+
+### Полезные опции
+
+- `--k-waves` — сколько длин волн отбирать в MI/SPA/ADMM top-k (по умолчанию 12);
+- `--n-splits`, `--fold-index`, `--seed` — параметры разбиения train/test;
+- `--device cuda|cpu` — где считать ADMM;
+- `--lambda-l1`, `--lambda-tv`, `--lambda-l2` — веса регуляризаторов ADMM;
+- `--rho-z`, `--rho-v` — параметры ADMM-сплита;
+- `--admm-max-iter`, `--admm-tol`, `--admm-log-every`, `--max-seconds` —
+  условия остановки ADMM;
+- `--spa-min-gap-nm` — минимальный шаг между соседними выбранными SPA-волнами.
+
+## Сводка по нескольким запускам
+
+`summarize_wavelength_runs_ru.py` собирает таблицы и графики из нескольких
+папок результатов в одну сводную (например, чтобы сравнить FX17 health,
+FX17 stages, IQ health, IQ stages):
 
 ```bash
-python3 /beta/home/sashanoir/run_wavelength_pipeline_ru.py \
-  --input-dir /beta/home/sashanoir/plots_iq_plantday_clean \
-  --outdir /beta/home/sashanoir/wavecmp_iq_stages_drop_day0_1_2 \
-  --dataset-name "IQ" \
-  --task stages \
-  --drop-days 0 1 2 \
-  --stage-map "ранняя:0,1,2,3;переходная:4;поздняя:5,7,8,9;симптоматическая:10" \
-  --k-waves 12 \
-  --device cuda \
-  --admm-max-iter 2000 \
-  --admm-tol 1e-4 \
-  --ae-epochs 300
-```
-
-## Сводные графики по четырем запускам
-
-```bash
-python3 /beta/home/sashanoir/summarize_wavelength_runs_ru.py \
-  --run-dirs \
-    /beta/home/sashanoir/wavecmp_fx_health_drop_day9 \
-    /beta/home/sashanoir/wavecmp_fx_stages_drop_day9 \
-    /beta/home/sashanoir/wavecmp_iq_health_drop_day0_1_2 \
-    /beta/home/sashanoir/wavecmp_iq_stages_drop_day0_1_2 \
-  --outdir /beta/home/sashanoir/wavecmp_summary_ru
-```
-
-## Быстрый запуск без автоэнкодера
-
-```bash
---methods full mi pca spa admm_direct admm_top12
-```
-
-## Быстрый запуск без ADMM
-
-```bash
---methods full mi pca spa autoencoder
+python3 summarize_wavelength_runs_ru.py \
+  --run-dirs ./out/fx17_health ./out/fx17_stages ./out/iq_health ./out/iq_stages \
+  --outdir ./out/summary
 ```

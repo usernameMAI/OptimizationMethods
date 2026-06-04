@@ -13,11 +13,9 @@ import matplotlib.pyplot as plt
 METHOD_ORDER = [
     "Полный спектр LR",
     "MI top-12 + LR",
-    "PCA, 12 компонент + LR",
     "SPA top-12 + LR",
     "ADMM direct LS",
     "ADMM top-12 + LR",
-    "Автоэнкодер latent + LR",
 ]
 
 TASK_LABELS = {"health": "здоровые / больные", "stages": "временные стадии"}
